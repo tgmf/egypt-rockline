@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rockline</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #120b09; overflow: hidden; }
+  canvas { display: block; width: 100%; height: 100%; }
+  body.idle { cursor: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+// ================= TWEAK ME =================
+const CFG = {
+  // motion
+  speed: 450,            // px per second, the bus
+  dotX: 1,             // dot position across the screen (0..1)
+
+  // day cycle: midnight -> sunrise -> noon -> sunset -> midnight
+  cycleSeconds: 120,     // length of a full day
+  startPhase: 0.2,       // where in the day to begin (0 midnight, .25 sunrise, .5 noon, .75 sunset)
+  stars: 220,            // number of stars at night
+  // colours at each time of day (phase 0..1). sky fades top -> horizon.
+  palette: [
+    { at: 0,    skyTop: '#03050d', skyHorizon: '#0d1226', ground: '#000000', line: '#000000', dot: '#0d1226', stars: 1 },
+    { at: 0.25, skyTop: '#ffffff', skyHorizon: '#BACDDB', ground: '#874F42', line: '#874F42', dot: '#BACDDB', stars: 0.1 },
+    { at: 0.5,  skyTop: '#ffffff', skyHorizon: '#ffffff', ground: '#B99DA1', line: '#B99DA1', dot: '#ffffff', stars: 0 },
+    { at: 0.75, skyTop: '#2b2852', skyHorizon: '#ff6428', ground: '#271F1F', line: '#271F1F', dot: '#ff6428', stars: 0.1 },
+    { at: 1,    skyTop: '#03050d', skyHorizon: '#0d1226', ground: '#000000', line: '#000000', dot: '#0d1226', stars: 1 },
+  ],
+
+
+  // look
+  lineWidth: 2,
+  dotGlow: 3,            // glow blur in px, 0 = none
+  dotRadius: 2,
+
+  // placement on screen
+  baseY: 0.62,           // where height 0 sits (fraction of screen height, from top)
+  heightScale: 0.7,      // how much of the screen height the ridge can span
+
+  // sample spacing: gap = stepMin + random^stepBias * stepRange
+  stepMin: 2,            // smallest gap between points, px
+  stepRange: 48,         // extra random gap on top, px
+  stepBias: 1.5,         // >1 favours short gaps, <1 favours long ones
+
+  // corner rounding: per point random in [roundMin, roundMin + roundRange] (0 = sharp)
+  roundMin: 0.04,
+  roundRange: 0.26,
+
+  // rock shape
+  octaves: 7,            // layers of detail
+  baseFreq: 1100,        // size in px of the biggest features
+  octaveGain: 0.6,       // how strong each finer layer is
+  octaveFreq: 2.2,       // how much finer each layer gets
+  stepLevels: 7,         // number of cliff terraces
+  stepSharp: 7,          // steepness of the cliff faces
+  stepMix: 0.65,         // 0 = smooth hills, 1 = all terraces
+  crumbleMid: 0.03,      // jitter amounts: medium, fine, blocky
+  crumbleFine: 0.025,
+  crumbleBlock: 0.035,
+  blockSize: 7,          // px width of the blocky jitter
+
+  // swing: amplitude wanders slowly between calm stretches and big lunges
+  swingMin: 0.7,         // calmest amplitude
+  swingRange: 1.5,       // extra amplitude in big lunges
+  swingLength: 2200,     // px length of a calm/lunge stretch
+  swingWobble: 0.3,      // fast extra wobble in amplitude
+  swingWobbleLength: 600,
+};
+// ============================================
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+const nextStep = () => CFG.stepMin + Math.pow(Math.random(), CFG.stepBias) * CFG.stepRange;
+const nextRound = () => CFG.roundMin + Math.random() * CFG.roundRange;
+const SEED = Math.random() * 1000;
+
+// --- colour helpers ---
+const hex = c => [1, 3, 5].map(i => parseInt(c.slice(i, i + 2), 16));
+const mixC = (a, b, t) => 'rgb(' + hex(a).map((v, i) => Math.round(v + (hex(b)[i] - v) * t)).join(',') + ')';
+function palette(phase) {
+  const P = CFG.palette;
+  let i = 0;
+  while (i < P.length - 2 && phase > P[i + 1].at) i++;
+  const a = P[i], b = P[i + 1];
+  const t = smooth(clamp((phase - a.at) / (b.at - a.at), 0, 1));
+  return {
+    skyTop: mixC(a.skyTop, b.skyTop, t), skyHorizon: mixC(a.skyHorizon, b.skyHorizon, t),
+    ground: mixC(a.ground, b.ground, t), line: mixC(a.line, b.line, t), dot: mixC(a.dot, b.dot, t),
+    stars: a.stars + (b.stars - a.stars) * t,
+  };
+}
+const STARS = Array.from({ length: CFG.stars }, () => ({
+  x: Math.random(), y: Math.random() * CFG.baseY, r: 0.4 + Math.random() * 1.1, tw: Math.random() * 6.28,
+}));
+
+let w, h, dpr;
+function resize() {
+  dpr = window.devicePixelRatio || 1;
+  w = innerWidth; h = innerHeight;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+addEventListener('resize', resize);
+resize();
+
+// --- the rock: jagged, stepped, like a cut cliff face ---
+const hash = n => { const s = Math.sin(n * 127.1 + 311.7) * 43758.5453; return s - Math.floor(s); };
+const noise = x => {
+  const i = Math.floor(x), f = x - i, u = f * f * (3 - 2 * f);
+  return hash(i) * (1 - u) + hash(i + 1) * u;
+};
+const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
+const smooth = t => t * t * (3 - 2 * t);
+
+// returns 0..1 height at world distance d
+function rock(d) {
+  d += SEED * 1000;
+  let v = 0, amp = 1, sum = 0, fr = 1 / CFG.baseFreq;
+  for (let o = 0; o < CFG.octaves; o++) {
+    v += amp * noise(d * fr + o * 97.3);
+    sum += amp; amp *= CFG.octaveGain; fr *= CFG.octaveFreq;
+  }
+  v /= sum;
+  const L = CFG.stepLevels, s = v * L, k = Math.floor(s), f = s - k;
+  const stepped = (k + smooth(clamp((f - 0.5) * CFG.stepSharp, 0, 1))) / L;      // sheer faces
+  const r = v * (1 - CFG.stepMix) + stepped * CFG.stepMix
+       + (noise(d / 11) - 0.5) * CFG.crumbleMid + (noise(d / 3.5) - 0.5) * CFG.crumbleFine
+       + (hash(Math.floor(d / CFG.blockSize)) - 0.5) * CFG.crumbleBlock;  // crumbly, fractured edge
+  const swing = CFG.swingMin + Math.pow(noise(d / CFG.swingLength + 500), 1.3) * CFG.swingRange
+       + noise(d / CFG.swingWobbleLength + 900) * CFG.swingWobble;
+  return clamp(0.5 + (r - 0.5) * swing, -0.03, 1.03);
+}
+
+// --- state ---
+let dist = 0, last = 0;
+let pts = [];
+const dotX = () => w * CFG.dotX;
+const yOf = r => h * CFG.baseY - r * h * CFG.heightScale;
+
+function fill() {
+  const need = dotX() + 40;
+  while (pts.length === 0 || dist - pts[0].d < need) {
+    // prefill history so the line already trails behind at start
+    const d = pts.length ? pts[pts.length - 1].d + nextStep() : dist - need;
+    pts.push({ d, r: rock(d), s: nextRound() });
+    if (d > dist) break;
+  }
+}
+dist = dotX() + 40;
+fill();
+
+function frame(t) {
+  const dt = Math.min(0.05, (t - last) / 1000 || 0);
+  last = t;
+  dist += CFG.speed * dt;
+
+  // extend samples up to the head, drop those scrolled off the left
+  while (pts[pts.length - 1].d < dist) {
+    const d = pts[pts.length - 1].d + nextStep();
+    pts.push({ d, r: rock(d), s: nextRound() });
+  }
+  while (pts.length > 2 && dist - pts[1].d > dotX() + 40) pts.shift();
+
+  const phase = (CFG.startPhase + t / 1000 / CFG.cycleSeconds) % 1;
+  const col = palette(phase);
+
+  const sky = ctx.createLinearGradient(0, 0, 0, h * CFG.baseY);
+  sky.addColorStop(0, col.skyTop);
+  sky.addColorStop(1, col.skyHorizon);
+  ctx.fillStyle = sky;
+  ctx.fillRect(0, 0, w, h);
+
+  if (col.stars > 0.01) {
+    ctx.fillStyle = '#fff';
+    for (const st of STARS) {
+      ctx.globalAlpha = col.stars * (0.6 + 0.4 * Math.sin(t / 700 + st.tw));
+      ctx.beginPath();
+      ctx.arc(st.x * w, st.y * h, st.r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  const hx = dotX();
+  // head sits on the polyline itself: interpolate between the samples around dist
+  let j = pts.length - 1;
+  while (j > 0 && pts[j].d > dist) j--;
+  const p0 = pts[j], p1 = pts[Math.min(j + 1, pts.length - 1)];
+  const k = p1.d > p0.d ? (dist - p0.d) / (p1.d - p0.d) : 0;
+  const headY = yOf(p0.r + (p1.r - p0.r) * k);
+
+  ctx.strokeStyle = col.line;
+  ctx.lineWidth = CFG.lineWidth;
+  ctx.lineJoin = 'miter';
+  const line = new Path2D();
+  // screen-space vertices; each corner is rounded by its own random amount (s)
+  const P = [];
+  for (let i = 0; i <= j; i++) P.push({ x: hx - (dist - pts[i].d), y: yOf(pts[i].r), s: pts[i].s });
+  P.push({ x: hx, y: headY, s: 0 });
+  line.moveTo(P[0].x, P[0].y);
+  for (let i = 1; i < P.length - 1; i++) {
+    const a = P[i - 1], c = P[i], n = P[i + 1];
+    line.lineTo(c.x + (a.x - c.x) * c.s, c.y + (a.y - c.y) * c.s);
+    line.quadraticCurveTo(c.x, c.y, c.x + (n.x - c.x) * c.s, c.y + (n.y - c.y) * c.s);
+  }
+  line.lineTo(hx, headY);
+
+  // ground: fill from the line down to the bottom of the screen
+  const ground = new Path2D(line);
+  ground.lineTo(hx, h);
+  ground.lineTo(P[0].x, h);
+  ground.closePath();
+  if (CFG.dotX >= 1) {                                      // ground only when the dot rides the right edge
+    ctx.fillStyle = col.ground;
+    ctx.fill(ground);
+  }
+
+  ctx.stroke(line);
+
+  ctx.fillStyle = col.dot;
+  ctx.shadowColor = col.dot;
+  ctx.shadowBlur = CFG.dotGlow;
+  ctx.beginPath();
+  ctx.arc(hx, headY, CFG.dotRadius, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.shadowBlur = 0;
+
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// --- screensaver behaviour: click for fullscreen, hide idle cursor ---
+addEventListener('click', () => {
+  if (!document.fullscreenElement) document.documentElement.requestFullscreen?.();
+  else document.exitFullscreen?.();
+});
+let idle;
+addEventListener('mousemove', () => {
+  document.body.classList.remove('idle');
+  clearTimeout(idle);
+  idle = setTimeout(() => document.body.classList.add('idle'), 2000);
+});
+</script>
+</body>
+</html>
